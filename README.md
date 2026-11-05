@@ -1,2 +1,2 @@
 # Celest
-Sound machine made in Svelte
+Chords the algorithmic way
