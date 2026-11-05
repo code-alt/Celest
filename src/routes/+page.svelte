@@ -18,7 +18,7 @@
   let complexity = $state(10);
   let conventionalism = $state(90);
   let voiceSpread = $state(20);
-  let allowModulation = $state(true);
+    let allowModulation = $state(true);
   let currentChord = $state("");
   let nextChord = $state("");
   let nextKeyChange = $state("");
