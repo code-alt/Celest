@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-
+  
   let midiInputs = $state([]);
   let midiOutputs = $state([]);
   let selectedInputId = $state("");
@@ -239,8 +239,10 @@
 
   function safeSend(output, message) {
     try {
-      output?.send(message);
-    } catch {}
+      output?.send(message); // in case someone trips over a cable
+    } catch (e) {
+      console.log(e);
+    } 
   }
 
   function buildDeviceNotes(device, chord) {
