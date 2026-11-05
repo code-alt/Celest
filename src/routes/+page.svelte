@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
 
   let midiInputs = $state([]);
+  let midiOutputs = $state([]);
   let selectedInputId = $state("");
   let selectedChannel = $state("");
   let selectedVoicing = $state("");
@@ -14,10 +15,19 @@
   let timeSignature = $state("4/4");
   let chordChangeRate = $state("measure");
   let selectedKey = $state("C-major");
-  let complexity = $state(50);
-  let conventionalism = $state(50);
-  let voiceSpread = $state(50);
+  let complexity = $state(10);
+  let conventionalism = $state(90);
+  let voiceSpread = $state(20);
+  let allowModulation = $state(true);
+  let currentChord = $state("");
+  let nextChord = $state("");
+  let nextKeyChange = $state("");
   let nextDeviceId = 0;
+  let midiAccess;
+  let progressionTimer;
+  let activeNotes = [];
+  let chordIndex = -1;
+  let progressionKey = $state("C-major");
 
   const channels = Array.from({ length: 16 }, (_, index) => index + 1);
 
@@ -37,15 +47,26 @@
   }
 
   function toggleStarted() {
-    isStarted = !isStarted;
+    if (isStarted) {
+      stopProgression();
+    } else {
+      startProgression();
+    }
   }
 
   function cutOffAllVoices() {
-    isStarted = false;
+    stopProgression();
+    for (const output of midiOutputs) {
+      for (let channel = 0; channel < 16; channel++) {
+        safeSend(output, [0xb0 | channel, 120, 0]);
+        safeSend(output, [0xb0 | channel, 123, 0]);
+      }
+    }
   }
 
   function selectTheme(event) {
     themeMode = event.currentTarget.value;
+    localStorage.setItem("theme", themeMode);
     applyTheme(themeMode);
   }
 
@@ -62,30 +83,269 @@
     return channels.find((channel) => !isChannelUsed(inputId, channel)) ?? "";
   }
 
-  onMount(async () => {
-    applyTheme(themeMode);
+  const noteNames = [
+    "C",
+    "C#",
+    "D",
+    "Eb",
+    "E",
+    "F",
+    "F#",
+    "G",
+    "Ab",
+    "A",
+    "Bb",
+    "B",
+  ];
+  const keyRoots = {
+    C: 0,
+    "C#": 1,
+    Db: 1,
+    D: 2,
+    Eb: 3,
+    E: 4,
+    F: 5,
+    "F#": 6,
+    Gb: 6,
+    G: 7,
+    "G#": 8,
+    Ab: 8,
+    A: 9,
+    Bb: 10,
+    B: 11,
+  };
+  const majorScale = [0, 2, 4, 5, 7, 9, 11];
+  const minorScale = [0, 2, 3, 5, 7, 8, 10];
+  const majorChordNames = ["I", "ii", "iii", "IV", "V", "vi", "vii°"];
+  const minorChordNames = ["i", "ii°", "III", "iv", "v", "VI", "VII"];
 
-    if (!navigator.requestMIDIAccess) {
-      error = "Web MIDI is not supported in this browser.";
-      return;
-    }
+  function parseKey(key = selectedKey) {
+    const [root, mode] = key.split("-");
+    return { root, mode, rootMidi: keyRoots[root] ?? 0 };
+  }
 
+  function formatKey(rootMidi, mode) {
+    return `${noteNames[rootMidi % 12]} ${mode === "major" ? "Major" : "Minor"}`;
+  }
+
+  function getChord(key, degree, index) {
+    const { mode, rootMidi } = parseKey(key);
+    const scale = mode === "major" ? majorScale : minorScale;
+    const chordNames = mode === "major" ? majorChordNames : minorChordNames;
+    const root = (rootMidi + scale[degree]) % 12;
+    const intervals =
+      mode === "major"
+        ? [
+            [0, 4, 7],
+            [0, 3, 7],
+            [0, 3, 7],
+            [0, 4, 7],
+            [0, 4, 7],
+            [0, 3, 7],
+            [0, 3, 6],
+          ][degree]
+        : [
+            [0, 3, 7],
+            [0, 3, 6],
+            [0, 4, 7],
+            [0, 3, 7],
+            [0, 3, 7],
+            [0, 4, 7],
+            [0, 4, 7],
+          ][degree];
+    const majorSeventh =
+      mode === "major"
+        ? degree === 0 || degree === 3
+        : degree === 2 || degree === 5;
+    const seventh = majorSeventh ? 11 : 10;
+    const extension = complexity >= 35 ? seventh : null;
+    const chordIntervals =
+      extension === null ? intervals : [...intervals, extension];
+    if (complexity >= 85) chordIntervals.push(14);
+
+    return {
+      degree,
+      index,
+      root,
+      intervals: chordIntervals,
+      name: `${noteNames[root]} ${chordNames[degree]}${
+        extension === null
+          ? ""
+          : `${extension === 11 ? "maj" : ""}${complexity >= 85 ? "9" : "7"}`
+      }`,
+    };
+  }
+
+  function getNextProgression() {
+    const { mode, rootMidi } = parseKey(progressionKey);
+    const nextIndex = chordIndex + 1;
+    const shouldModulate =
+      allowModulation &&
+      complexity >= 60 &&
+      conventionalism <= 45 &&
+      nextIndex > 0 &&
+      nextIndex % 8 === 0;
+    const targetRoot = (rootMidi + 7) % 12;
+    const targetKey = shouldModulate
+      ? `${noteNames[targetRoot]}-${mode}`
+      : progressionKey;
+    const progression =
+      conventionalism >= 70
+        ? [0, 3, 4, 0, 5, 3, 4, 0]
+        : [0, 3, 4, 5, 0, 3, 4, 0];
+    const degree =
+      conventionalism <= 35
+        ? (nextIndex * 3 + Math.round(complexity)) % 7
+        : progression[nextIndex % progression.length];
+    const chord = getChord(targetKey, degree, nextIndex);
+    return {
+      chord,
+      targetKey: shouldModulate ? formatKey(targetRoot, mode) : "",
+      targetKeyId: shouldModulate ? targetKey : "",
+    };
+  }
+
+  function getBeatDuration() {
+    const [beats, denominator] = timeSignature.split("/").map(Number);
+    const beat = (60000 / Math.max(1, Number(bpm))) * (4 / denominator);
+    const units =
+      chordChangeRate === "beat"
+        ? 1
+        : chordChangeRate === "two-measures"
+          ? beats * 2
+          : chordChangeRate === "four-measures"
+            ? beats * 4
+            : chordChangeRate === "eight-measures"
+              ? beats * 8
+              : beats;
+    return Math.max(50, beat * units);
+  }
+
+  function getOutputForDevice(device) {
+    return (
+      midiOutputs.find((output) => output.id === device.inputId) ??
+      midiOutputs.find((output) => output.name === device.name) ??
+      midiOutputs[0]
+    );
+  }
+
+  function sendNote(output, channel, note, velocity, on) {
+    safeSend(output, [
+      on ? 0x90 | (channel - 1) : 0x80 | (channel - 1),
+      note,
+      on ? velocity : 0,
+    ]);
+  }
+
+  function safeSend(output, message) {
     try {
-      const midiAccess = await navigator.requestMIDIAccess();
+      output?.send(message);
+    } catch {}
+  }
 
-      const updateInputs = () => {
-        midiInputs = Array.from(midiAccess.inputs.values());
-      };
+  function buildDeviceNotes(device, chord) {
+    const voiceTotal = Math.max(1, Number(device.voiceCount));
+    const base = 36 + (device.voicing - 1) * 12;
+    const octaveRange = Math.round((Number(voiceSpread) / 100) * 3);
+    return Array.from({ length: voiceTotal }, (_, index) => {
+      const tones = chord.intervals.length;
+      const interval =
+        chord.intervals[index % tones] + 12 * Math.floor(index / tones);
+      const spread =
+        octaveRange === 0
+          ? 0
+          : Math.floor((index * octaveRange) / Math.max(1, voiceTotal - 1));
+      let note = base + chord.root + interval + spread * 12;
+      while (note > 120) note -= 12;
+      return note;
+    });
+  }
 
-      updateInputs();
-      midiAccess.onstatechange = updateInputs;
-
-      return () => {
-        midiAccess.onstatechange = null;
-      };
-    } catch {
-      error = "MIDI access was denied. Check your browser permissions.";
+  function playChord(chord) {
+    stopNotes();
+    const played = [];
+    for (const device of selectedDevices) {
+      const output = getOutputForDevice(device);
+      if (!output) continue;
+      const notes = buildDeviceNotes(device, chord);
+      const channel = Number(device.channel);
+      for (const note of notes) {
+        sendNote(output, channel, note, 96, true);
+        played.push({ output, channel, note });
+      }
     }
+    activeNotes = played;
+  }
+
+  function stopNotes() {
+    for (const { output, channel, note } of activeNotes) {
+      sendNote(output, channel, note, 0, false);
+    }
+    activeNotes = [];
+  }
+
+  function advanceChord() {
+    const { chord, targetKeyId } = getNextProgression();
+    chordIndex = chord.index;
+    if (targetKeyId) progressionKey = targetKeyId;
+    currentChord = chord.name;
+    const next = getNextProgression();
+    nextChord = next.chord.name;
+    nextKeyChange = next.targetKey;
+    playChord(chord);
+    if (isStarted) {
+      progressionTimer = window.setTimeout(advanceChord, getBeatDuration());
+    }
+  }
+
+  function startProgression() {
+    error = "";
+    isStarted = true;
+    progressionKey = selectedKey;
+    chordIndex = -1;
+    advanceChord();
+  }
+
+  function stopProgression() {
+    isStarted = false;
+    window.clearTimeout(progressionTimer);
+    progressionTimer = undefined;
+    stopNotes();
+    currentChord = "";
+    nextChord = "";
+    nextKeyChange = "";
+  }
+
+  onMount(() => {
+    themeMode = localStorage.getItem("theme") ?? "auto";
+    applyTheme(themeMode);
+    let disposed = false;
+
+    async function initializeMidi() {
+      if (!navigator.requestMIDIAccess) {
+        error = "Web MIDI is not supported in this browser.";
+        return;
+      }
+      try {
+        midiAccess = await navigator.requestMIDIAccess();
+        if (disposed) return;
+        const updatePorts = () => {
+          midiInputs = Array.from(midiAccess.inputs.values());
+          midiOutputs = Array.from(midiAccess.outputs.values());
+        };
+        updatePorts();
+        midiAccess.onstatechange = updatePorts;
+      } catch {
+        error = "MIDI access was denied. Check your browser permissions.";
+      }
+    }
+    initializeMidi();
+
+    return () => {
+      disposed = true;
+      stopProgression();
+      if (midiAccess) midiAccess.onstatechange = null;
+    };
   });
 
   function addDevice() {
@@ -157,7 +417,7 @@
     class="flex flex-col items-center gap-1.5 min-[1230px]:w-[200px] min-[1230px]:flex-none min-[1230px]:hidden"
   >
     <h1 class="text-center text-3xl text-cyan-700 dark:text-cyan-100">
-      Celeste
+      Celest
     </h1>
     <span class="text-sm text-slate-600 dark:text-slate-400"
       >by Ethan Solace</span
@@ -182,9 +442,28 @@
       <p class="text-sm font-medium text-slate-900 dark:text-slate-100">
         Chord information
       </p>
-      <p class="mt-3 text-2xl font-semibold text-cyan-700 dark:text-cyan-300">
-        Stopped
-      </p>
+      {#if currentChord}
+        <p class="mt-3 text-2xl font-semibold text-cyan-700 dark:text-cyan-300">
+          {currentChord}
+        </p>
+        <span class="mt-2 text-sm text-slate-600 dark:text-slate-400">
+          Next: {nextChord}
+        </span>
+        {#if nextKeyChange}
+          <span class="mt-1 text-xs text-amber-700 dark:text-amber-300">
+            Modulating to {nextKeyChange}
+          </span>
+        {/if}
+      {:else}
+        <p
+          class="mt-3 text-2xl font-semibold text-slate-500 dark:text-slate-400"
+        >
+          Stopped
+        </p>
+        <span class="mt-2 text-sm text-slate-600 dark:text-slate-400">
+          Press Start to begin the progression
+        </span>
+      {/if}
     </div>
   </div>
 
@@ -195,7 +474,7 @@
       class="hidden items-center justify-center gap-1.5 min-[1230px]:flex min-[1230px]:w-[600px] min-[1230px]:flex-none mb-3"
     >
       <h1 class="text-center text-3xl text-cyan-700 dark:text-cyan-100">
-        Celeste
+        Celest
       </h1>
       <span class="mt-3 text-sm text-slate-600 dark:text-slate-400"
         >by Ethan Solace</span
@@ -377,7 +656,7 @@
             for="key"
             class="font-medium text-slate-900 dark:text-slate-100"
           >
-            Key
+            Starting Key
           </label>
           <select
             id="key"
@@ -465,6 +744,8 @@
             <option value="beat">By beat</option>
             <option value="measure">Per measure</option>
             <option value="two-measures">Per 2 measures</option>
+            <option value="four-measures">Per 4 measures</option>
+            <option value="eight-measures">Per 8 measures</option>
           </select>
         </div>
         <div
@@ -529,6 +810,20 @@
           <span class="text-right text-slate-600 dark:text-slate-400"
             >{voiceSpread}</span
           >
+        </div>
+        <div class="mt-3 flex items-center justify-between gap-4">
+          <label
+            for="allow-modulation"
+            class="font-medium text-slate-900 dark:text-slate-100"
+          >
+            Allow modulations
+          </label>
+          <input
+            id="allow-modulation"
+            type="checkbox"
+            bind:checked={allowModulation}
+            class="h-4 w-4 cursor-pointer accent-cyan-500"
+          />
         </div>
         <button
           type="button"
