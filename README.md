@@ -2,4 +2,4 @@
 Chords the algorithmic way
 
 # To install
-run `npm run dev`
+Run `npm run dev`
